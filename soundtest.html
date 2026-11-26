@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sound test</title>
+    <style>
+        :root { color-scheme: light dark; --bg: #fff; --fg: #111; --button: #e8e8ee; }
+        @media (prefers-color-scheme: dark) { :root { --bg: #16181d; --fg: #eee; --button: #2c2f38; } }
+        body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 16px -apple-system, system-ui, sans-serif; }
+        h1 { font-size: 20px; }
+        .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 16px; }
+        button { font: inherit; padding: 12px 14px; border: 0; border-radius: 8px; background: var(--button); color: var(--fg); }
+        label { display: block; margin: 8px 0; }
+        pre { white-space: pre-wrap; font-size: 13px; }
+    </style>
+</head>
+<body>
+<!-- A test of the browser's audio without the app: the same sine tone at 48 and 44.1 kHz, played by
+     the browser itself (oscillator) and by an AudioWorklet as the app's player does, optionally
+     with the microphone open. On an iPad 7 with iPadOS 16.3 the app sounded like a ring modulator. -->
+<h1>Sound test</h1>
+<p>The first six buttons play 440 Hz for 2 seconds. A clean tone is a plain beep; a broken one rattles, warbles or has a second tone.</p>
+<label><input type="checkbox" id="mic"> Microphone open while playing</label>
+<div class="row">
+    <button data-rate="48000" data-way="osc">48 kHz browser</button>
+    <button data-rate="44100" data-way="osc">44.1 kHz browser</button>
+    <button data-rate="" data-way="osc">default browser</button>
+</div>
+<div class="row">
+    <button data-rate="48000" data-way="worklet">48 kHz worklet</button>
+    <button data-rate="44100" data-way="worklet">44.1 kHz worklet</button>
+    <button data-rate="" data-way="worklet">default worklet</button>
+</div>
+<p>The app's piano without a worklet: a piano-like tone from a buffer, played by the browser at another
+pitch, retuned and faded out as the app does with its samples.</p>
+<div class="row">
+    <button data-rate="" data-way="sample">sample, browser nodes</button>
+</div>
+<p>Recording: 2 seconds from the microphone (play or sing something), then played back with the
+microphone closed. A clean recording sounds like what you played.</p>
+<div class="row">
+    <button data-record="worklet">record with a worklet (as the app)</button>
+    <button data-record="script">record without a worklet</button>
+</div>
+<button id="copy">Copy log</button>
+<pre id="log"></pre>
+<script>
+    var logged = [];
+    function log(line) {
+        logged.push(line);
+        document.getElementById('log').textContent = logged.join('\n');
+    }
+    log(navigator.userAgent);
+
+    var worklet = 'registerProcessor("sine", class extends AudioWorkletProcessor {' +
+        ' constructor() { super(); this.phase = 0; }' +
+        ' process(inputs, outputs) { var out = outputs[0][0];' +
+        '  for (var i = 0; i < out.length; i++) { out[i] = 0.3 * Math.sin(this.phase); this.phase += 2 * Math.PI * 440 / sampleRate; }' +
+        '  return true; } });';
+    var stream = null;
+
+    async function play(rate, way) {
+        var wantMic = document.getElementById('mic').checked;
+        if (wantMic && !stream) {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+            } catch (e) {
+                log('microphone failed: ' + e);
+            }
+        }
+        if (!wantMic && stream) {
+            stream.getTracks().forEach(function (t) { t.stop(); });
+            stream = null;
+        }
+        var options = { latencyHint: 'interactive' };
+        if (rate) options.sampleRate = Number(rate);
+        var context;
+        try {
+            context = new AudioContext(options);
+        } catch (e) {
+            log((rate || 'default') + ' Hz: context failed: ' + e);
+            return;
+        }
+        await context.resume();
+        var source = null;
+        if (stream) {
+            try {
+                source = context.createMediaStreamSource(stream);
+                var silent = context.createGain();
+                silent.gain.value = 0;
+                source.connect(silent).connect(context.destination);
+            } catch (e) {
+                log('microphone into the context failed: ' + e);
+            }
+        }
+        var node;
+        try {
+            if (way === 'sample') {
+                // Like the app's sampled piano: a recorded note (here made up: 330 Hz with overtones, decaying),
+                // played faster for a higher note, retuned, then released.
+                var seconds = 3, rate0 = context.sampleRate;
+                var buffer = context.createBuffer(1, seconds * rate0, rate0);
+                var data = buffer.getChannelData(0);
+                for (var i = 0; i < data.length; i++) {
+                    var t = i / rate0, x = 0;
+                    for (var h = 1; h <= 6; h++) x += Math.sin(2 * Math.PI * 330 * h * t) / (h * h);
+                    data[i] = 0.4 * x * Math.exp(-1.5 * t) * Math.min(1, t * 200);
+                }
+                node = context.createBufferSource();
+                node.buffer = buffer;
+                node.playbackRate.value = 440 / 330;
+                var voice = context.createGain();
+                voice.gain.value = 0.8;
+                node.connect(voice).connect(context.destination);
+                var now = context.currentTime;
+                node.start(now);
+                node.playbackRate.setValueAtTime(494 / 330, now + 0.7);
+                voice.gain.setTargetAtTime(0, now + 1.4, 0.08);
+                node.stop(now + 2);
+            } else if (way === 'osc') {
+                node = context.createOscillator();
+                node.frequency.value = 440;
+                var gain = context.createGain();
+                gain.gain.value = 0.3;
+                node.connect(gain).connect(context.destination);
+                node.start();
+            } else {
+                await context.audioWorklet.addModule(URL.createObjectURL(new Blob([worklet], { type: 'application/javascript' })));
+                node = new AudioWorkletNode(context, 'sine');
+                node.connect(context.destination);
+            }
+        } catch (e) {
+            log(way + ' failed: ' + e);
+        }
+        log((rate || 'default') + ' asked, ' + way + ': context ' + context.sampleRate + ' Hz, base latency ' +
+            context.baseLatency + ', output latency ' + context.outputLatency + ', ' + context.state +
+            (stream ? ', microphone ' + JSON.stringify(stream.getAudioTracks()[0].getSettings()) : ', no microphone'));
+        setTimeout(function () { context.close(); }, 2000);
+    }
+
+    async function record(way) {
+        var mic;
+        try {
+            mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+        } catch (e) {
+            log('microphone failed: ' + e);
+            return;
+        }
+        var context = new AudioContext({ latencyHint: 'interactive' });
+        await context.resume();
+        var source = context.createMediaStreamSource(mic);
+        var parts = [], node;
+        try {
+            if (way === 'worklet') {
+                var code = 'registerProcessor("rec", class extends AudioWorkletProcessor {' +
+                    ' process(inputs) { var x = inputs[0][0]; if (x) this.port.postMessage(x.slice()); return true; } });';
+                await context.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
+                node = new AudioWorkletNode(context, 'rec', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+                node.port.onmessage = function (e) { parts.push(e.data); };
+            } else {
+                node = context.createScriptProcessor(1024, 1, 1);
+                node.onaudioprocess = function (e) { parts.push(e.inputBuffer.getChannelData(0).slice()); };
+            }
+            // Nodes only run while they lead to the output; they write nothing there.
+            source.connect(node);
+            node.connect(context.destination);
+        } catch (e) {
+            log('recording ' + way + ' failed: ' + e);
+            mic.getTracks().forEach(function (t) { t.stop(); });
+            context.close();
+            return;
+        }
+        log('recording 2 s ' + (way === 'worklet' ? 'with a worklet' : 'without a worklet') + ', context ' + context.sampleRate + ' Hz, microphone ' +
+            JSON.stringify(mic.getAudioTracks()[0].getSettings()));
+        await new Promise(function (r) { setTimeout(r, 2000); });
+        source.disconnect();
+        node.disconnect();
+        mic.getTracks().forEach(function (t) { t.stop(); });
+        var total = parts.reduce(function (n, p) { return n + p.length; }, 0);
+        var all = new Float32Array(total), at = 0, peak = 0, sum = 0;
+        parts.forEach(function (p) { all.set(p, at); at += p.length; });
+        for (var i = 0; i < all.length; i++) { peak = Math.max(peak, Math.abs(all[i])); sum += all[i] * all[i]; }
+        log('  recorded ' + (total / context.sampleRate).toFixed(2) + ' s, peak ' + peak.toFixed(3) + ', rms ' + Math.sqrt(sum / Math.max(1, total)).toFixed(4) + '; playing it back');
+        if (!total) { context.close(); return; }
+        // Back at a level one can hear, by the browser itself, with the microphone closed.
+        var gain = peak > 0 ? Math.min(20, 0.7 / peak) : 1;
+        var buffer = context.createBuffer(1, total, context.sampleRate);
+        buffer.getChannelData(0).set(all.map(function (x) { return x * gain; }));
+        var play = context.createBufferSource();
+        play.buffer = buffer;
+        play.connect(context.destination);
+        play.start();
+        play.onended = function () { context.close(); };
+    }
+
+    document.querySelectorAll('button[data-record]').forEach(function (b) {
+        b.onclick = function () { record(b.dataset.record); };
+    });
+    document.querySelectorAll('button[data-way]').forEach(function (b) {
+        b.onclick = function () { play(b.dataset.rate, b.dataset.way); };
+    });
+    document.getElementById('copy').onclick = function () {
+        navigator.clipboard.writeText(logged.join('\n')).then(function () { log('(copied)'); }, function (e) { log('copy failed: ' + e); });
+    };
+</script>
+</body>
+</html>
